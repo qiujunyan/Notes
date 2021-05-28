@@ -23,7 +23,9 @@ class TransConfig(object):
                             layer_norm_eps=1e-10,
                             dropout=0.0,
                             is_decoder=False,
-                            casual_mask=False)'''
+                            casual_mask=False,
+                            neg_inf=-1e10,
+                            eps=1e-10)'''
     self.init_word_embedding = config.get("init_word_embedding", False)
     self.vocab_size = config.get("vocab_size", None)
     self.hidden_size = config.get("hidden_size", None)
@@ -37,6 +39,8 @@ class TransConfig(object):
     self.is_decoder = config.get("is_decoder", False)
     self.casual_mask = config.get("casual_mask", self.is_decoder)
     self.init_range = config.get("init_range", 0.02)
+    self.neg_inf=config.get("neg_inf", -1e10)
+    self.eps=config.get("eps", 1e-10)
 
 
 class TransModel(nn.Module):
@@ -52,9 +56,40 @@ class TransModel(nn.Module):
 
     self.init_weights()
 
-  def forward(self, input_ids=None, encoder_states=None,
-              attention_mask=None, encoder_attention_mask=None,
-              token_type_ids=None, position_ids=None, inputs_embeds=None):
+  def forward(self, input_ids: torch.LongTensor = None,
+              encoder_states: torch.FloatTensor = None,
+              attention_mask=None,
+              encoder_attention_mask=None,
+              token_type_ids: torch.LongTensor = None,
+              position_ids: torch.LongTensor = None,
+              inputs_embeds: torch.FloatTensor = None):
+    """
+    :param input_ids: ids of target sequence
+    :param encoder_states: outputs of transformer encoder, useful when model is explained as a decoder
+    :param attention_mask: self attention mask, When bool tensor is provided and a value is True, the corresponding value on
+    the attention layer will be ignored. Otherwise, the non-zero corresponded value will be ignored.
+    :param encoder_attention_mask: cross attention mask, When a value is True, the corresponding value on
+    the attention layer will be ignored. Otherwise, the non-zero corresponded value will be ignored.
+    :param token_type_ids: [optional]
+    :param position_ids: [optional]
+    :param inputs_embeds: embeddings of source sequence, useful when config.init_word_embedding is False
+    :return:
+
+    shape:
+    -Inputs:
+    -input_ids: batch_size * tgt_seq_lens
+    -encoder_states: batch_size * src_seq_lens * hidden_size
+    -attention_mask: batch_size * tgt_seq_lens
+    -encoder_attention_mask: batch_size * src_seq_lens * tgt_seq_lens
+    -token_type_ids:
+    -position_ids:
+    inputs_embeds: batch_size * tgt_seq_lens * hidden_size
+
+    -Outputs:
+    -encoder_outputs: batch_size * tgt_seq_lens*  hidden_size
+    -pooler_outputs: batch_size * hidden_size
+    """
+
     if input_ids is not None:
       input_shape = input_ids.size()
     elif inputs_embeds is not None:
@@ -90,8 +125,12 @@ class TransModel(nn.Module):
       extended_attention_mask = causal_mask[:, None, :, :] * attention_mask[:, None, None, :]
     else:
       extended_attention_mask = attention_mask[:, None, None, :]
-    extended_attention_mask = 1 - extended_attention_mask
-    extended_attention_mask = extended_attention_mask.bool()
+
+    if isinstance(extended_attention_mask.cpu(), torch.BoolTensor):
+      extended_attention_mask = ~extended_attention_mask
+    else:
+      extended_attention_mask = 1 - extended_attention_mask
+      extended_attention_mask = extended_attention_mask.bool()
     return extended_attention_mask
 
   @staticmethod
@@ -119,9 +158,13 @@ class TransEncoder(nn.Module, ABC):
     self.layer = clones(TransLayer(config), config.num_layers)
 
   def forward(self, hidden_states,
-              attention_mask,
+              attention_mask: torch.BoolTensor,
               encoder_hidden_states,
-              encoder_attention_mask):
+              encoder_attention_mask: torch.BoolTensor):
+    r"""
+    attention_mask: (batch_size, seq_lens), if a value is True,
+    the correspoding value on the attention layer will be ignored.
+    """
     for i, layer in enumerate(self.layer):
       hidden_states = layer(hidden_states,
                             attention_mask,
@@ -255,6 +298,7 @@ class TransSelfAtention(nn.Module):
   def __init__(self, config: TransConfig):
     super(TransSelfAtention, self).__init__()
     assert config.hidden_size % config.num_heads == 0
+    self.neg_inf = config.neg_inf
     self.hidden_size = config.hidden_size
     self.num_heads = config.num_heads
     self.head_size = config.hidden_size // config.num_heads
@@ -287,7 +331,7 @@ class TransSelfAtention(nn.Module):
     attention_scores = attention_scores / math.sqrt(self.head_size)
 
     if attention_mask is not None:
-      attention_scores = attention_scores.masked_fill(attention_mask, -1e32)
+      attention_scores = attention_scores.masked_fill(attention_mask, self.neg_inf)
     attention_probs = torch.softmax(attention_scores, -1)
     attention_probs = self.dropout(attention_probs)
 
